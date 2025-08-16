@@ -1,0 +1,198 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      run_deploy:
+        description: 'Run deploy job?'
+        required: true
+        default: 'false'
+
+env:
+  PROJECT_ID: ${{ vars.PROJECT_ID }}
+  GCP_REGION: ${{ vars.GCP_REGION }}
+  WIF_PROVIDER: ${{ secrets.WIF_PROVIDER }}
+  WIF_SERVICE_ACCOUNT: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+  WIF_SERVICE_ACCOUNT_CR: ${{ secrets.WIF_SERVICE_ACCOUNT_CR }}
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+jobs:
+  lint_and_test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.9'
+        cache: 'pip'
+
+    - name: Install Poetry
+      uses: snok/install-poetry@v1
+      with:
+        version: 1.8.3
+        virtualenvs-create: true
+        virtualenvs-in-project: true
+
+    - name: Load cached venv
+      id: cached-poetry-dependencies
+      uses: actions/cache@v4
+      with:
+        path: .venv
+        key: venv-${{ runner.os }}-${{ hashFiles('**/poetry.lock') }}
+
+    - name: Install dependencies
+      run: |
+        poetry install --no-interaction --no-root
+
+    - name: Run linting
+      run: |
+        poetry run flake8 --version
+        poetry run flake8 src/ tests/ --count --statistics
+
+    - name: Run unit tests with coverage
+      run: |
+        poetry run pytest
+
+  build_and_push:
+    if: ${{ github.event.inputs.run_deploy == 'true' }} && github.event.name == 'push' && github.ref == 'refs/heads/main'
+    needs: lint_and_test
+    runs-on: ubuntu-latest
+    environment: dev
+    outputs:
+      image_tags: ${{ steps.set-outputs.outputs.image_tags }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Authenticate to Google Cloud
+      id: auth
+      uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: ${{ env.WIF_PROVIDER }}
+        service_account: ${{ env.WIF_SERVICE_ACCOUNT }}
+        token_format: 'access_token'
+        create_credentials_file: true
+        export_environment_variables: true
+        
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+      with:
+        project_id: ${{ env.PROJECT_ID }}
+        install_components: 'beta,gke-gcloud-auth-plugin'
+
+    - name: Configure Docker for Artifact Registry
+      run: |
+        gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev --quiet
+        # Verify authentication
+        gcloud auth list --filter=status:ACTIVE --format='value(account)'
+
+    - name: Extract Docker metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ github.event.repository.name }}/fastapi-app
+        tags: |
+          type=raw,value=latest
+
+    - name: Build Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: false
+        load: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ steps.meta.outputs.tags }}
+        format: 'table'
+        # output: 'trivy-results.sarif'
+        exit-code: '0'
+        ignore-unfixed: true
+        vuln-type: 'os,library'
+        severity: 'CRITICAL,HIGH'
+        timeout: '10m'
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      # if: always()
+      if: false
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+    - name: Push Docker image
+      if: success()
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64
+        provenance: true
+        sbom: true
+
+    - name: Set job outputs
+      id: set-outputs
+      run: |
+        echo "image_tags=${{ steps.meta.outputs.tags }}" >> $GITHUB_OUTPUT
+
+  deploy:
+    needs: build_and_push
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.run_deploy == 'true' }} && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: dev
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Authenticate to Google Cloud
+      id: auth
+      uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: ${{ env.WIF_PROVIDER }}
+        service_account: ${{ env.WIF_SERVICE_ACCOUNT_CR }}
+        token_format: 'access_token'
+        create_credentials_file: true
+        export_environment_variables: true
+        
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+      with:
+        project_id: ${{ env.PROJECT_ID }}
+        install_components: 'beta,gke-gcloud-auth-plugin'
+
+    - name: Deploy to Cloud Run
+      id: deploy
+      uses: google-github-actions/deploy-cloudrun@v2
+      with:
+        service: ${{ github.event.repository.name }}
+        region: ${{ env.GCP_REGION }}
+        image: ${{ needs.build_and_push.outputs.image_tags }}
+        flags: --platform=managed --allow-unauthenticated --port=8000
+
+    - name: Show Output
+      run: echo ${{ steps.deploy.outputs.url }}
