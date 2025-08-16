@@ -42,3 +42,21 @@ The CD pipeline includes:
 ### Github Environment Settings
 
 - Include the WIF Provider and Service Accounts to authenticate within the pipeline
+
+## Terraform Infrastructure
+
+This project uses Terraform to provision and manage the required GCP infrastructure:
+
+### Infrastructure Components
+
+- **Workload Identity Federation** - Secure authentication for GitHub Actions using OIDC
+- **Artifact Registry** - Docker image repository for storing application containers
+- **Service Accounts** - Dedicated service accounts for Artifact Registry and Cloud Run operations
+- **IAM Permissions** - Proper role assignments for secure access control
+
+### Key Resources
+
+- Workload Identity Pool and Provider for GitHub Actions
+- Artifact Registry repository for Docker images
+- Service accounts with minimal required permissions
+- IAM bindings for secure authentication
